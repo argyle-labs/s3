@@ -1,0 +1,49 @@
+[package]
+name = "s3"
+version = "0.1.0"
+edition = "2021"
+description = "S3-compatible object-store StorageBackend (userspace FUSE mount) — backend-only orca plugin"
+
+[package.metadata.orca]
+category = "storage"
+
+[lib]
+name = "s3"
+path = "src/lib.rs"
+# `rlib` retains the in-crate `#[cfg(test)]` harness + lets a consumer use it
+# as a normal Rust lib. No `cdylib`: this is a dynamic (subprocess) plugin — a
+# `[[bin]]` served over the orca socket, not a `dlopen`ed shared object. Keeping
+# the crate free of `cdylib` sidesteps the fleet-wide cdylib-in-release trap.
+crate-type = ["rlib"]
+
+[[bin]]
+name = "s3"
+path = "src/main.rs"
+
+# s3 is a BACKEND-ONLY orca plugin: it carries zero `#[orca_tool]`s and instead
+# registers a `storage` StorageBackend over the subprocess wire. Per
+# [[feedback-plugin-toolkit-only-no-exceptions]] it reaches the whole orca
+# system — infra AND the `storage` domain (`plugin_toolkit::storage`) — through
+# `plugin-toolkit` alone. It names no runtime crate (tokio/futures/chrono):
+# async plumbing rides orca's reactor seam via `plugin_toolkit`.
+#
+# The typed mount contract this plugin implements — StorageBackend +
+# MountStyle::UserspaceProcess + MountSpec / NormalizedSpec / OptionSet /
+# SecretRef — landed on orca `main` in PR #121 (commit 5ec9453f), so this plugin
+# consumes plugin-toolkit straight from git `main`. A developer building against
+# a local orca checkout at ../orca redirects this to the in-tree crate via the
+# `[patch]` in `.cargo/config.toml`; CI drops that patch and resolves the git dep.
+[dependencies]
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
+
+[dev-dependencies]
+# Dev-only: the in-crate test harness drives the async `S3Backend` methods under
+# `#[tokio::test]`. `serde_json` is reached through `plugin_toolkit::serde_json`,
+# so it needs no direct dep.
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+# Match orca's workspace lint floor: discarding a Result/Option via
+# `let _ = ...` was a load-bearing past incident, so keep it a hard error here
+# too — the plugin must stay portable back into the orca workspace.
+[lints.clippy]
+let_underscore_must_use = "deny"
