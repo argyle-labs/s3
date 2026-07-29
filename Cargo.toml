@@ -11,9 +11,9 @@ category = "storage"
 name = "s3"
 path = "src/lib.rs"
 # `rlib` retains the in-crate `#[cfg(test)]` harness + lets a consumer use it
-# as a normal Rust lib. No `cdylib`: this is a dynamic (subprocess) plugin — a
-# `[[bin]]` served over the orca socket, not a `dlopen`ed shared object. Keeping
-# the crate free of `cdylib` sidesteps the fleet-wide cdylib-in-release trap.
+# as a normal Rust lib. This is a subprocess `[[bin]]` plugin that talks to the
+# orca daemon over its Unix socket via `serve_storage_plugin!` from
+# `plugin-toolkit`. No FFI/cdylib.
 crate-type = ["rlib"]
 
 [[bin]]
