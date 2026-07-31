@@ -12,6 +12,18 @@
     </pattern>
   </defs>
   <g clip-path="url(#tile)"><rect x="16" y="16" width="480" height="480" fill="url(#argyle)"/></g>
-  <rect x="16" y="16" width="480" height="480" rx="108" fill="none" stroke="#2BD3D3" stroke-width="6"/>
-  <g fill="#7CA0C8"><rect x="150" y="168" width="212" height="60" rx="12"/><rect x="150" y="240" width="212" height="60" rx="12" opacity="0.85"/><circle cx="186" cy="198" r="9" fill="#0A1018"/><circle cx="186" cy="270" r="9" fill="#0A1018"/><g fill="none" stroke="#7CA0C8" stroke-width="12" stroke-linecap="round"><path d="M210 330 q46 -34 92 0"/><path d="M236 352 q20 -16 40 0"/></g><circle cx="256" cy="362" r="7" fill="#7CA0C8"/></g>
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="none" stroke="#7CA0C8" stroke-width="6"/>
+
+  <!-- object-storage bucket: tapered pail with three stacked "object" bands -->
+  <g stroke="#0A1018" stroke-width="7" stroke-linejoin="round">
+    <path d="M156 176 L184 344 C186 362 220 372 256 372 C292 372 326 362 328 344
+             L356 176 Z" fill="#7CA0C8"/>
+    <ellipse cx="256" cy="176" rx="102" ry="28" fill="#A9C5E1"/>
+    <ellipse cx="256" cy="176" rx="78" ry="17" fill="#0A1018" stroke="none"/>
+  </g>
+  <g fill="#DCEAF6">
+    <rect x="196" y="236" width="120" height="18" rx="9"/>
+    <rect x="201" y="278" width="110" height="18" rx="9"/>
+    <rect x="206" y="320" width="100" height="18" rx="9"/>
+  </g>
 </svg>
