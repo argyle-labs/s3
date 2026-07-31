@@ -29,10 +29,10 @@ path = "src/main.rs"
 #
 # The typed mount contract this plugin implements — StorageBackend +
 # MountStyle::UserspaceProcess + MountSpec / NormalizedSpec / OptionSet /
-# SecretRef — landed in orca via PR #121 (commit 5ec9453f) and ships in the
-# pinned RC tag below, so this plugin consumes plugin-toolkit from that tag.
+# SecretRef — is reached through `plugin-toolkit`, tracked at orca `main`
+# (fleet-canonical form) so this plugin always builds against the latest contract.
 [dependencies]
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.1.1-rc.22" }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main" }
 
 [dev-dependencies]
 # Dev-only: the in-crate test harness drives the async `S3Backend` methods under

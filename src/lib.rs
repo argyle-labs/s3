@@ -43,31 +43,31 @@ use plugin_toolkit::storage::{
 };
 
 /// S3 tool / transport errors. Expressed through the orca-native
-/// `#[plugin_error]` abstraction — the plugin names no error crate; the macro
+/// `#[orca_error]` abstraction — the plugin names no error crate; the macro
 /// emits `Display` + `std::error::Error` (with the `Io` source chain) + the
 /// `From<std::io::Error>` conversion.
-#[plugin_error]
+#[orca_error]
 pub enum S3Error {
-    #[plugin(display = "required FUSE mount tool not found on PATH: {0}")]
+    #[orca(display = "required FUSE mount tool not found on PATH: {0}")]
     MissingTool(String),
-    #[plugin(display = "s3 mount tool failed: {tool} (exit {code:?}): {stderr}")]
+    #[orca(display = "s3 mount tool failed: {tool} (exit {code:?}): {stderr}")]
     ToolFailed {
         tool: String,
         code: Option<i32>,
         stderr: String,
     },
-    #[plugin(display = "io: {0}", from)]
+    #[orca(display = "io: {0}", from)]
     Io(std::io::Error),
-    #[plugin(display = "unsupported on this platform")]
+    #[orca(display = "unsupported on this platform")]
     Unsupported,
 }
 
 /// The userspace FUSE mount tool that realizes the object mount. Each maps a
 /// bucket onto a local mountpoint as a long-lived process; the backend picks one
 /// per the declared `tool=` option (defaulting to [`MountTool::MountpointS3`]).
-#[plugin_struct]
+#[orca_struct]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[plugin(rename_all = "kebab-case")]
+#[orca(rename_all = "kebab-case")]
 pub enum MountTool {
     /// AWS's `mountpoint-s3` (binary: `mount-s3`).
     MountpointS3,
@@ -390,6 +390,7 @@ impl StorageBackend for S3Backend {
                 options: Some(render_s3_options(&cfg)),
             },
             credential: spec.credential.clone(),
+            secret_file: None, // s3 auth rides the credential SecretRef; no on-disk secret file
             remount_policy: spec.remount_policy.clone(),
             enabled: spec.enabled,
         })
@@ -695,13 +696,11 @@ mod tests {
             normalized.failover_sources.is_empty(),
             "object stores carry no failover"
         );
-        // The secret never rides in the normalized option string.
-        if let OptionSet::Raw { options } = &normalized.options {
-            let opts = options.as_deref().unwrap_or("");
-            assert!(!opts.contains("op://"), "secret must not be in options");
-        } else {
-            panic!("expected OptionSet::Raw");
-        }
+        // The secret never rides in the normalized option string. `OptionSet`
+        // has a single `Raw` variant, so this destructure is irrefutable.
+        let OptionSet::Raw { options } = &normalized.options;
+        let opts = options.as_deref().unwrap_or("");
+        assert!(!opts.contains("op://"), "secret must not be in options");
     }
 
     #[tokio::test]
