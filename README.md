@@ -24,6 +24,19 @@ s3 joins the same `StorageBackend` trait for the single-pane view, but diverges 
 
 S3 access-key / secret-key credentials are supplied through the storage domain's `SecretRef` mechanism — the secret is resolved by orca's secrets domain at mount time and is never written into a world-readable location or logged. Endpoint, region, and bucket are non-secret configuration carried in the mount spec.
 
+## Configuration
+
+Any S3-compatible service works the same way; there is no per-provider code. The mount spec carries:
+
+- `source`: `s3://bucket[/prefix]`
+- `endpoint=`: `http://` or `https://` URL (required)
+- `region=` (required)
+- `addressing=path|virtual-host` (default `path`)
+- `storage_class=` (optional)
+- `access_key=`, plus the secret access key as the credential `SecretRef`
+
+With rclone, all of this is passed as `RCLONE_S3_*` environment (`provider=Other`, `RCLONE_CONFIG=/dev/null`), so no rclone config is read or written.
+
 ## Run it without orca
 
 There's nothing to deploy: this plugin drives a FUSE mount tool you already run — one of [mountpoint-s3](https://github.com/awslabs/mountpoint-s3), [rclone](https://rclone.org/), or [goofys](https://github.com/kahing/goofys). Install/configure that directly, then register this plugin with orca.
