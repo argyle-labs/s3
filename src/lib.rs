@@ -109,6 +109,38 @@ impl MountTool {
     }
 }
 
+/// How bucket requests are addressed. Every S3-compatible service accepts one or
+/// both; which is configuration, never inferred from the endpoint.
+#[orca_struct]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[orca(rename_all = "kebab-case")]
+pub enum Addressing {
+    /// `https://endpoint/bucket/key`.
+    #[default]
+    Path,
+    /// `https://bucket.endpoint/key`.
+    VirtualHost,
+}
+
+impl Addressing {
+    fn parse(s: &str) -> Result<Self, StorageError> {
+        match s {
+            "path" => Ok(Addressing::Path),
+            "virtual-host" => Ok(Addressing::VirtualHost),
+            other => Err(StorageError::Other(format!(
+                "s3: unsupported addressing `{other}` (accepted: path, virtual-host)"
+            ))),
+        }
+    }
+
+    fn as_option_value(self) -> &'static str {
+        match self {
+            Addressing::Path => "path",
+            Addressing::VirtualHost => "virtual-host",
+        }
+    }
+}
+
 /// The validated S3 mount configuration parsed out of a [`MountSpec`]. The
 /// `storage` contract has no typed `OptionSet::S3` variant, so the backend owns
 /// this grammar itself and normalizes the raw option string into it; the
@@ -116,12 +148,17 @@ impl MountTool {
 /// canonicalized string) so the wire contract is unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct S3Config {
-    /// The bucket to mount (S3 `source`, e.g. `s3://my-bucket` or `my-bucket`).
+    /// The bucket (S3 `source`, e.g. `s3://my-bucket/prefix` or `my-bucket`).
     pub bucket: String,
-    /// S3-compatible endpoint URL (required for non-AWS: MinIO, R2, Wasabi …).
+    /// Key prefix inside the bucket, without leading/trailing `/`; empty for the root.
+    pub prefix: String,
+    /// S3-compatible endpoint URL (`http://` or `https://`).
     pub endpoint: String,
     /// Region (`us-east-1`, `auto`, …).
     pub region: String,
+    pub addressing: Addressing,
+    /// Storage class for written objects; the provider default when unset.
+    pub storage_class: Option<String>,
     /// Userspace FUSE tool that realizes the mount.
     pub tool: MountTool,
     /// Access-key id (non-secret half of the credential pair).
@@ -135,14 +172,21 @@ pub struct S3Config {
 
 /// Normalize a bucket source into a bare bucket name, accepting either the bare
 /// name or the `s3://bucket` URL form. Rejects an empty bucket.
-fn normalize_bucket(source: &str) -> Result<String, StorageError> {
+fn normalize_bucket(source: &str) -> Result<(String, String), StorageError> {
     let s = source.trim();
     let s = s.strip_prefix("s3://").unwrap_or(s);
-    let bucket = s.split('/').next().unwrap_or("").trim();
+    let (bucket, prefix) = s.split_once('/').unwrap_or((s, ""));
+    let bucket = bucket.trim();
     if bucket.is_empty() {
         return Err(StorageError::Other("s3 bucket is empty".into()));
     }
-    Ok(bucket.to_string())
+    let prefix: Vec<&str> = prefix.split('/').filter(|c| !c.is_empty()).collect();
+    if prefix.iter().any(|c| *c == "." || *c == "..") {
+        return Err(StorageError::Other(
+            "s3 prefix must not contain . or ..".into(),
+        ));
+    }
+    Ok((bucket.to_string(), prefix.join("/")))
 }
 
 /// Parse + validate an S3 mount spec into a typed [`S3Config`], enforcing the
@@ -152,10 +196,12 @@ fn normalize_bucket(source: &str) -> Result<String, StorageError> {
 /// helper (default `mountpoint-s3`). Inline secret material in the option string
 /// is rejected — the secret is a `SecretRef`, never a plaintext option.
 pub fn validate_s3_config(spec: &MountSpec) -> Result<S3Config, StorageError> {
-    let bucket = normalize_bucket(&spec.source)?;
+    let (bucket, prefix) = normalize_bucket(&spec.source)?;
 
     let mut endpoint: Option<String> = None;
     let mut region: Option<String> = None;
+    let mut addressing = Addressing::default();
+    let mut storage_class: Option<String> = None;
     let mut access_key_id: Option<String> = None;
     let mut tool = MountTool::MountpointS3;
     let mut extra: Vec<String> = Vec::new();
@@ -169,6 +215,8 @@ pub fn validate_s3_config(spec: &MountSpec) -> Result<S3Config, StorageError> {
         match (key, value) {
             ("endpoint", Some(v)) => endpoint = Some(v),
             ("region", Some(v)) => region = Some(v),
+            ("addressing", Some(v)) => addressing = Addressing::parse(&v)?,
+            ("storage_class", Some(v)) if !v.is_empty() => storage_class = Some(v),
             ("access_key" | "access_key_id", Some(v)) => access_key_id = Some(v),
             ("tool", Some(v)) => tool = MountTool::parse(&v)?,
             // The secret key must never be declared inline in the store — it is a
@@ -188,7 +236,12 @@ pub fn validate_s3_config(spec: &MountSpec) -> Result<S3Config, StorageError> {
     let endpoint = endpoint.ok_or_else(|| {
         StorageError::Other("s3: `endpoint=` is required in the mount options".into())
     })?;
-    let region = region.ok_or_else(|| {
+    if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
+        return Err(StorageError::Other(format!(
+            "s3: `endpoint={endpoint}` must be an http:// or https:// URL"
+        )));
+    }
+    let region = region.filter(|r| !r.is_empty()).ok_or_else(|| {
         StorageError::Other("s3: `region=` is required in the mount options".into())
     })?;
     let access_key_id = access_key_id.ok_or_else(|| {
@@ -200,8 +253,11 @@ pub fn validate_s3_config(spec: &MountSpec) -> Result<S3Config, StorageError> {
 
     Ok(S3Config {
         bucket,
+        prefix,
         endpoint,
         region,
+        addressing,
+        storage_class,
         tool,
         access_key_id,
         secret_access_key,
@@ -218,11 +274,53 @@ pub fn render_s3_options(cfg: &S3Config) -> String {
     let mut parts = vec![
         format!("endpoint={}", cfg.endpoint),
         format!("region={}", cfg.region),
+        format!("addressing={}", cfg.addressing.as_option_value()),
         format!("access_key={}", cfg.access_key_id),
         format!("tool={}", cfg.tool.as_option_value()),
     ];
+    if let Some(sc) = &cfg.storage_class {
+        parts.push(format!("storage_class={sc}"));
+    }
     parts.extend(cfg.extra.iter().cloned());
     parts.join(",")
+}
+
+/// rclone's `s3` backend configured entirely from env, so no rclone config file
+/// is read or written. `provider=Other` keeps rclone generic: endpoint, region and
+/// addressing come only from `cfg`. `secret` is the resolved secret access key.
+pub fn rclone_env(cfg: &S3Config, secret: &str) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("RCLONE_CONFIG".to_string(), "/dev/null".to_string()),
+        ("RCLONE_S3_PROVIDER".to_string(), "Other".to_string()),
+        ("RCLONE_S3_ENV_AUTH".to_string(), "false".to_string()),
+        ("RCLONE_S3_ENDPOINT".to_string(), cfg.endpoint.clone()),
+        ("RCLONE_S3_REGION".to_string(), cfg.region.clone()),
+        (
+            "RCLONE_S3_FORCE_PATH_STYLE".to_string(),
+            (cfg.addressing == Addressing::Path).to_string(),
+        ),
+        (
+            "RCLONE_S3_ACCESS_KEY_ID".to_string(),
+            cfg.access_key_id.clone(),
+        ),
+        (
+            "RCLONE_S3_SECRET_ACCESS_KEY".to_string(),
+            secret.to_string(),
+        ),
+    ];
+    if let Some(sc) = &cfg.storage_class {
+        env.push(("RCLONE_S3_STORAGE_CLASS".to_string(), sc.clone()));
+    }
+    env
+}
+
+/// `:s3:bucket[/prefix]`, the on-the-fly remote `rclone_env` configures.
+pub fn rclone_remote(cfg: &S3Config) -> String {
+    if cfg.prefix.is_empty() {
+        format!(":s3:{}", cfg.bucket)
+    } else {
+        format!(":s3:{}/{}", cfg.bucket, cfg.prefix)
+    }
 }
 
 // ── storage domain backend ──────────────────────────────────────────────────
@@ -273,26 +371,28 @@ async fn spawn_mount(cfg: &S3Config, target: &str, secret: &str) -> Result<(), S
                 .arg(&cfg.endpoint)
                 .arg("--region")
                 .arg(&cfg.region);
+            if cfg.addressing == Addressing::Path {
+                c = c.arg("--force-path-style");
+            }
+            if !cfg.prefix.is_empty() {
+                c = c.arg("--prefix").arg(format!("{}/", cfg.prefix));
+            }
             for e in &cfg.extra {
                 c = c.arg(e);
             }
             c
         }
         MountTool::Rclone => {
-            // `rclone mount :s3:<bucket> <mountpoint> --s3-endpoint <ep> ...`
+            // Endpoint, region, addressing and credentials ride `rclone_env`.
             let mut c = Command::new(bin);
-            c = c
-                .arg("mount")
-                .arg(format!(":s3:{}", cfg.bucket))
-                .arg(target)
-                .arg("--s3-endpoint")
-                .arg(&cfg.endpoint)
-                .arg("--s3-region")
-                .arg(&cfg.region);
+            c = c.arg("mount").arg(rclone_remote(cfg)).arg(target);
             for e in &cfg.extra {
                 c = c.arg(e);
             }
-            c
+            for (k, v) in rclone_env(cfg, secret) {
+                c = c.env(k, v);
+            }
+            return c.spawn().map(|_| ()).map_err(Into::into);
         }
         MountTool::Goofys => {
             // `goofys --endpoint <ep> --region <r> <bucket> <mountpoint>`
@@ -302,10 +402,18 @@ async fn spawn_mount(cfg: &S3Config, target: &str, secret: &str) -> Result<(), S
                 .arg(&cfg.endpoint)
                 .arg("--region")
                 .arg(&cfg.region);
+            if cfg.addressing == Addressing::VirtualHost {
+                c = c.arg("--subdomain");
+            }
             for e in &cfg.extra {
                 c = c.arg(e);
             }
-            c.arg(&cfg.bucket).arg(target)
+            let bucket = if cfg.prefix.is_empty() {
+                cfg.bucket.clone()
+            } else {
+                format!("{}:{}", cfg.bucket, cfg.prefix)
+            };
+            c.arg(bucket).arg(target)
         }
     };
 
@@ -746,5 +854,84 @@ mod tests {
         assert!(e.to_string().contains("unsupported"));
         let io: S3Error = std::io::Error::other("x").into();
         assert!(io.to_string().starts_with("io:"));
+    }
+
+    fn cfg(opts: &str) -> S3Config {
+        validate_s3_config(&s3_spec(
+            "s3://b/backups/immich/",
+            Some(opts),
+            Some("op://x"),
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn source_prefix_is_kept_and_normalized() {
+        let c = cfg(HAPPY_OPTS);
+        assert_eq!(
+            (c.bucket.as_str(), c.prefix.as_str()),
+            ("b", "backups/immich")
+        );
+        assert_eq!(rclone_remote(&c), ":s3:b/backups/immich");
+        let spec = s3_spec("s3://b/../x", Some(HAPPY_OPTS), Some("op://x"));
+        assert!(validate_s3_config(&spec).is_err());
+    }
+
+    #[test]
+    fn addressing_defaults_to_path_and_is_configurable() {
+        assert_eq!(cfg(HAPPY_OPTS).addressing, Addressing::Path);
+        let vh = cfg(&format!("{HAPPY_OPTS},addressing=virtual-host"));
+        assert_eq!(vh.addressing, Addressing::VirtualHost);
+        assert!(render_s3_options(&vh).contains("addressing=virtual-host"));
+        let spec = s3_spec(
+            "b",
+            Some(&format!("{HAPPY_OPTS},addressing=dns")),
+            Some("op://x"),
+        );
+        assert!(validate_s3_config(&spec).is_err());
+    }
+
+    #[test]
+    fn endpoint_must_be_a_url_and_region_non_empty() {
+        for opts in [
+            "endpoint=s3.example.com,region=r,access_key=A",
+            "endpoint=https://s3.example.com,region=,access_key=A",
+        ] {
+            assert!(
+                validate_s3_config(&s3_spec("b", Some(opts), Some("op://x"))).is_err(),
+                "{opts}"
+            );
+        }
+    }
+
+    #[test]
+    fn rclone_env_is_provider_neutral_and_config_driven() {
+        let c = cfg(&format!(
+            "{HAPPY_OPTS},addressing=virtual-host,storage_class=GLACIER_IR"
+        ));
+        let env: std::collections::HashMap<_, _> = rclone_env(&c, "s3cr3t").into_iter().collect();
+        assert_eq!(env["RCLONE_CONFIG"], "/dev/null");
+        assert_eq!(env["RCLONE_S3_PROVIDER"], "Other");
+        assert_eq!(env["RCLONE_S3_ENV_AUTH"], "false");
+        assert_eq!(env["RCLONE_S3_ENDPOINT"], "https://s3.example.com");
+        assert_eq!(env["RCLONE_S3_REGION"], "us-east-1");
+        assert_eq!(env["RCLONE_S3_FORCE_PATH_STYLE"], "false");
+        assert_eq!(env["RCLONE_S3_STORAGE_CLASS"], "GLACIER_IR");
+        assert_eq!(env["RCLONE_S3_SECRET_ACCESS_KEY"], "s3cr3t");
+        assert_eq!(
+            rclone_env(&cfg(HAPPY_OPTS), "k")
+                .into_iter()
+                .find(|(k, _)| k == "RCLONE_S3_FORCE_PATH_STYLE")
+                .unwrap()
+                .1,
+            "true"
+        );
+    }
+
+    #[test]
+    fn secret_stays_out_of_the_remote_and_options() {
+        let c = cfg(HAPPY_OPTS);
+        assert!(!rclone_remote(&c).contains("op://"));
+        assert!(!render_s3_options(&c).contains("op://"));
     }
 }
