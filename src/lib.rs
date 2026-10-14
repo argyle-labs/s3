@@ -323,6 +323,41 @@ pub fn rclone_remote(cfg: &S3Config) -> String {
     }
 }
 
+/// rclone `crypt` layered over the `:s3:` remote, configured from env only, so
+/// objects are encrypted client-side before they reach the provider. Both
+/// passwords must already be `rclone obscure`d, the form `RCLONE_CRYPT_PASSWORD`
+/// expects; losing them makes every object unrecoverable, so the caller holds
+/// them in orca secrets. Add these to [`rclone_env`] and address
+/// [`RCLONE_CRYPT_REMOTE`].
+pub fn rclone_crypt_env(
+    cfg: &S3Config,
+    obscured_password: &str,
+    obscured_salt: &str,
+) -> Vec<(String, String)> {
+    vec![
+        ("RCLONE_CRYPT_REMOTE".to_string(), rclone_remote(cfg)),
+        (
+            "RCLONE_CRYPT_FILENAME_ENCRYPTION".to_string(),
+            "standard".to_string(),
+        ),
+        (
+            "RCLONE_CRYPT_DIRECTORY_NAME_ENCRYPTION".to_string(),
+            "true".to_string(),
+        ),
+        (
+            "RCLONE_CRYPT_PASSWORD".to_string(),
+            obscured_password.to_string(),
+        ),
+        (
+            "RCLONE_CRYPT_PASSWORD2".to_string(),
+            obscured_salt.to_string(),
+        ),
+    ]
+}
+
+/// The on-the-fly crypt remote [`rclone_crypt_env`] configures.
+pub const RCLONE_CRYPT_REMOTE: &str = ":crypt:";
+
 // ── storage domain backend ──────────────────────────────────────────────────
 
 /// S3-compatible object-store backend for the `storage` domain.
@@ -926,6 +961,20 @@ mod tests {
                 .1,
             "true"
         );
+    }
+
+    #[test]
+    fn crypt_wraps_the_s3_remote_with_env_only_keys() {
+        let c = cfg(HAPPY_OPTS);
+        let env: std::collections::HashMap<_, _> = rclone_crypt_env(&c, "obs-pass", "obs-salt")
+            .into_iter()
+            .collect();
+        assert_eq!(env["RCLONE_CRYPT_REMOTE"], rclone_remote(&c));
+        assert_eq!(env["RCLONE_CRYPT_FILENAME_ENCRYPTION"], "standard");
+        assert_eq!(env["RCLONE_CRYPT_DIRECTORY_NAME_ENCRYPTION"], "true");
+        assert_eq!(env["RCLONE_CRYPT_PASSWORD"], "obs-pass");
+        assert_eq!(env["RCLONE_CRYPT_PASSWORD2"], "obs-salt");
+        assert!(!RCLONE_CRYPT_REMOTE.contains("obs-"));
     }
 
     #[test]
