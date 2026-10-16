@@ -29,11 +29,12 @@ S3 access-key / secret-key credentials are supplied through the storage domain's
 Any S3-compatible service works the same way; there is no per-provider code. The mount spec carries:
 
 - `source`: `s3://bucket[/prefix]`
-- `endpoint=`: `http://` or `https://` URL (required)
+- `endpoint=`: `https://` URL (required); `http://` only for loopback or with `allow_insecure`
 - `region=` (required)
 - `addressing=path|virtual-host` (default `path`)
 - `storage_class=` (optional)
 - `access_key=`, plus the secret access key as the credential `SecretRef`
+- extra tool flags: per-tool allowlist only; TLS-off, `allow-other` and mode/umask flags are rejected. Mounts are always file `0600` / dir `0700`.
 
 With rclone, all of this is passed as `RCLONE_S3_*` environment (`provider=Other`, `RCLONE_CONFIG=/dev/null`), so no rclone config is read or written.
 
