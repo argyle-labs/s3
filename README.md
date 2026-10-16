@@ -33,7 +33,7 @@ Any S3-compatible service works the same way; there is no per-provider code. The
 - `region=` (required)
 - `addressing=path|virtual-host` (default `path`)
 - `storage_class=` (optional)
-- `access_key=`, plus the secret access key as the credential `SecretRef`
+- `access_key=<secret name>`, plus the secret access key as the credential `SecretRef` (or `credential=<secret name>`); both are names resolved through orca secrets, never values
 - extra tool flags: per-tool allowlist only; TLS-off, `allow-other` and mode/umask flags are rejected. Mounts are always file `0600` / dir `0700`.
 
 With rclone, all of this is passed as `RCLONE_S3_*` environment (`provider=Other`, `RCLONE_CONFIG=/dev/null`), so no rclone config is read or written.

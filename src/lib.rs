@@ -24,9 +24,9 @@
 //!
 //! ## Credential safety
 //!
-//! S3 access-key / secret-key material arrives as a [`SecretRef`] the secrets
-//! domain resolves; the resolved secret is passed to the FUSE tool through its
-//! environment / credentials file, never rendered into the world-readable option
+//! The access key and secret key are [`SecretRef`] names resolved through the
+//! secrets domain at mount time; resolution fails closed. Resolved values reach
+//! the FUSE tool only through its environment, never rendered into the world-readable option
 //! string or logged. `validate_spec` rejects a spec that declares inline secret
 //! material in the option string.
 
@@ -161,10 +161,7 @@ pub struct S3Config {
     pub storage_class: Option<String>,
     /// Userspace FUSE tool that realizes the mount.
     pub tool: MountTool,
-    /// Access-key id (non-secret half of the credential pair).
-    pub access_key_id: String,
-    /// Secret access key, resolved by the secrets domain from a [`SecretRef`].
-    /// Never rendered into the option string or logged.
+    pub access_key_id: SecretRef,
     pub secret_access_key: SecretRef,
     pub extra: Vec<String>,
 }
@@ -202,6 +199,7 @@ pub fn validate_s3_config(spec: &MountSpec) -> Result<S3Config, StorageError> {
     let mut addressing = Addressing::default();
     let mut storage_class: Option<String> = None;
     let mut access_key_id: Option<String> = None;
+    let mut credential: Option<String> = None;
     let mut tool = MountTool::MountpointS3;
     let mut allow_insecure = false;
     let mut extra: Vec<String> = Vec::new();
@@ -218,6 +216,7 @@ pub fn validate_s3_config(spec: &MountSpec) -> Result<S3Config, StorageError> {
             ("addressing", Some(v)) => addressing = Addressing::parse(&v)?,
             ("storage_class", Some(v)) if !v.is_empty() => storage_class = Some(v),
             ("access_key" | "access_key_id", Some(v)) => access_key_id = Some(v),
+            ("credential", Some(v)) if !v.is_empty() => credential = Some(v),
             ("tool", Some(v)) => tool = MountTool::parse(&v)?,
             ("allow_insecure", None) => allow_insecure = true,
             ("allow_insecure", Some(v)) => allow_insecure = v == "true",
@@ -251,15 +250,24 @@ pub fn validate_s3_config(spec: &MountSpec) -> Result<S3Config, StorageError> {
     let region = region.filter(|r| !r.is_empty()).ok_or_else(|| {
         StorageError::Other("s3: `region=` is required in the mount options".into())
     })?;
-    let access_key_id = access_key_id.ok_or_else(|| {
-        StorageError::Other("s3: `access_key=` is required in the mount options".into())
-    })?;
+    let access_key_id = access_key_id
+        .filter(|v| !v.is_empty())
+        .map(SecretRef)
+        .ok_or_else(|| {
+            StorageError::Other("s3: `access_key=` is required in the mount options".into())
+        })?;
     for e in &extra {
         check_extra(tool, e)?;
     }
-    let secret_access_key = spec.credential.clone().ok_or_else(|| {
-        StorageError::Other("s3: a credential SecretRef (the secret access key) is required".into())
-    })?;
+    let secret_access_key = spec
+        .credential
+        .clone()
+        .or(credential.map(SecretRef))
+        .ok_or_else(|| {
+            StorageError::Other(
+                "s3: a credential SecretRef (the secret access key) is required".into(),
+            )
+        })?;
 
     Ok(S3Config {
         bucket,
@@ -435,7 +443,7 @@ pub fn render_s3_options(cfg: &S3Config) -> String {
         format!("endpoint={}", cfg.endpoint),
         format!("region={}", cfg.region),
         format!("addressing={}", cfg.addressing.as_option_value()),
-        format!("access_key={}", cfg.access_key_id),
+        format!("access_key={}", cfg.access_key_id.0),
         format!("tool={}", cfg.tool.as_option_value()),
     ];
     if let Some(sc) = &cfg.storage_class {
@@ -448,10 +456,38 @@ pub fn render_s3_options(cfg: &S3Config) -> String {
     parts.join(",")
 }
 
+pub struct S3Credentials {
+    access_key_id: String,
+    secret_access_key: String,
+}
+
+impl std::fmt::Debug for S3Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("S3Credentials(<redacted>)")
+    }
+}
+
+pub fn resolve_credentials<F, E>(cfg: &S3Config, get: F) -> Result<S3Credentials, StorageError>
+where
+    F: Fn(&str) -> Result<Option<String>, E>,
+{
+    let resolve = |r: &SecretRef| match get(&r.0) {
+        Ok(Some(v)) if !v.is_empty() => Ok(v),
+        _ => Err(StorageError::Other(format!(
+            "s3: secret '{}' is not resolvable",
+            r.0
+        ))),
+    };
+    Ok(S3Credentials {
+        access_key_id: resolve(&cfg.access_key_id)?,
+        secret_access_key: resolve(&cfg.secret_access_key)?,
+    })
+}
+
 /// rclone's `s3` backend configured entirely from env, so no rclone config file
 /// is read or written. `provider=Other` keeps rclone generic: endpoint, region and
 /// addressing come only from `cfg`. `secret` is the resolved secret access key.
-pub fn rclone_env(cfg: &S3Config, secret: &str) -> Vec<(String, String)> {
+pub fn rclone_env(cfg: &S3Config, creds: &S3Credentials) -> Vec<(String, String)> {
     let mut env = vec![
         ("RCLONE_CONFIG".to_string(), "/dev/null".to_string()),
         ("RCLONE_S3_PROVIDER".to_string(), "Other".to_string()),
@@ -464,11 +500,11 @@ pub fn rclone_env(cfg: &S3Config, secret: &str) -> Vec<(String, String)> {
         ),
         (
             "RCLONE_S3_ACCESS_KEY_ID".to_string(),
-            cfg.access_key_id.clone(),
+            creds.access_key_id.clone(),
         ),
         (
             "RCLONE_S3_SECRET_ACCESS_KEY".to_string(),
-            secret.to_string(),
+            creds.secret_access_key.clone(),
         ),
     ];
     if let Some(sc) = &cfg.storage_class {
@@ -550,10 +586,6 @@ impl Default for S3Backend {
 /// option string). Returns once the tool has been spawned; long-lived
 /// supervision (restart-on-crash) is orca core's job once the UserspaceProcess
 /// applier lands — see the module docs and README.
-///
-/// `secret` is the *resolved* secret access key. In the wired-up flow orca's
-/// secrets domain resolves `cfg.secret_access_key` before calling the backend;
-/// until that seam exists, callers pass the raw `SecretRef` inner string.
 pub fn mount_args(cfg: &S3Config, target: &str) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
     match cfg.tool {
@@ -618,7 +650,7 @@ pub fn mount_args(cfg: &S3Config, target: &str) -> Vec<String> {
 
 /// Launch the configured FUSE tool to mount `bucket` at `target`. The resolved
 /// secret is passed through the child's environment, never the command line.
-async fn spawn_mount(cfg: &S3Config, target: &str, secret: &str) -> Result<(), S3Error> {
+async fn spawn_mount(cfg: &S3Config, target: &str, creds: &S3Credentials) -> Result<(), S3Error> {
     let bin = cfg.tool.binary();
     which(bin).ok_or_else(|| S3Error::MissingTool(bin.to_string()))?;
     if cfg.tool == MountTool::MountpointS3 {
@@ -632,13 +664,13 @@ async fn spawn_mount(cfg: &S3Config, target: &str, secret: &str) -> Result<(), S
     }
     let mut cmd = Command::new(bin).args(mount_args(cfg, target));
     if cfg.tool == MountTool::Rclone {
-        for (k, v) in rclone_env(cfg, secret) {
+        for (k, v) in rclone_env(cfg, creds) {
             cmd = cmd.env(k, v);
         }
     } else {
         cmd = cmd
-            .env("AWS_ACCESS_KEY_ID", &cfg.access_key_id)
-            .env("AWS_SECRET_ACCESS_KEY", secret);
+            .env("AWS_ACCESS_KEY_ID", &creds.access_key_id)
+            .env("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
     }
     cmd.spawn()?;
     Ok(())
@@ -721,10 +753,6 @@ impl StorageBackend for S3Backend {
     /// tool. `id` is the declarative option string (the same grammar
     /// `validate_spec` accepts) so this method is self-contained until core's
     /// UserspaceProcess applier passes a normalized spec through.
-    ///
-    /// NOTE: the resolved secret is taken from the parsed [`SecretRef`]'s inner
-    /// string. Once orca core resolves the SecretRef through the secrets domain
-    /// before invoking the backend, that resolved value flows in here unchanged.
     async fn mount(&self, id: &str, target: &str) -> Result<MountOutcome, StorageError> {
         // `id` carries the declarative spec: bucket in `source` position is not
         // available here, so callers pass the option string; the backend still
@@ -746,8 +774,8 @@ impl StorageBackend for S3Backend {
             enabled: true,
         };
         let cfg = validate_s3_config(&spec)?;
-        let secret = cfg.secret_access_key.0.clone();
-        spawn_mount(&cfg, target, &secret)
+        let creds = resolve_credentials(&cfg, plugin_toolkit::secrets::get)?;
+        spawn_mount(&cfg, target, &creds)
             .await
             .map_err(|e| StorageError::Transport(e.to_string()))?;
         Ok(MountOutcome {
@@ -882,7 +910,7 @@ mod tests {
         assert_eq!(cfg.bucket, "my-bucket");
         assert_eq!(cfg.endpoint, "https://s3.example.com");
         assert_eq!(cfg.region, "us-east-1");
-        assert_eq!(cfg.access_key_id, "AKIA");
+        assert_eq!(cfg.access_key_id, SecretRef("AKIA".into()));
         assert_eq!(cfg.tool, MountTool::MountpointS3); // default
         assert_eq!(
             cfg.secret_access_key,
@@ -1245,7 +1273,8 @@ mod tests {
         let c = cfg(&format!(
             "{HAPPY_OPTS},addressing=virtual-host,storage_class=GLACIER_IR"
         ));
-        let env: std::collections::HashMap<_, _> = rclone_env(&c, "s3cr3t").into_iter().collect();
+        let env: std::collections::HashMap<_, _> =
+            rclone_env(&c, &creds("AK", "s3cr3t")).into_iter().collect();
         assert_eq!(env["RCLONE_CONFIG"], "/dev/null");
         assert_eq!(env["RCLONE_S3_PROVIDER"], "Other");
         assert_eq!(env["RCLONE_S3_ENV_AUTH"], "false");
@@ -1253,15 +1282,66 @@ mod tests {
         assert_eq!(env["RCLONE_S3_REGION"], "us-east-1");
         assert_eq!(env["RCLONE_S3_FORCE_PATH_STYLE"], "false");
         assert_eq!(env["RCLONE_S3_STORAGE_CLASS"], "GLACIER_IR");
+        assert_eq!(env["RCLONE_S3_ACCESS_KEY_ID"], "AK");
         assert_eq!(env["RCLONE_S3_SECRET_ACCESS_KEY"], "s3cr3t");
         assert_eq!(
-            rclone_env(&cfg(HAPPY_OPTS), "k")
+            rclone_env(&cfg(HAPPY_OPTS), &creds("a", "k"))
                 .into_iter()
                 .find(|(k, _)| k == "RCLONE_S3_FORCE_PATH_STYLE")
                 .unwrap()
                 .1,
             "true"
         );
+    }
+
+    fn creds(a: &str, s: &str) -> S3Credentials {
+        S3Credentials {
+            access_key_id: a.into(),
+            secret_access_key: s.into(),
+        }
+    }
+
+    fn store(name: &str) -> Result<Option<String>, ()> {
+        Ok(match name {
+            "AKIA" => Some("resolved-ak".into()),
+            "op://x" => Some("resolved-sk".into()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn credentials_resolve_by_name_never_from_the_ref_string() {
+        let c = validate_s3_config(&s3_spec("b", Some(HAPPY_OPTS), Some("op://x"))).unwrap();
+        let r = resolve_credentials(&c, store).unwrap();
+        assert_eq!(r.access_key_id, "resolved-ak");
+        assert_eq!(r.secret_access_key, "resolved-sk");
+        assert_ne!(r.access_key_id, c.access_key_id.0);
+        assert_ne!(r.secret_access_key, c.secret_access_key.0);
+        assert!(!format!("{r:?}").contains("resolved"));
+        let env = rclone_env(&c, &r);
+        assert!(env.iter().all(|(_, v)| v != "op://x" && v != "AKIA"));
+    }
+
+    #[test]
+    fn credentials_fail_closed_when_unresolvable() {
+        let missing = validate_s3_config(&s3_spec("b", Some(HAPPY_OPTS), Some("nope"))).unwrap();
+        let err = resolve_credentials(&missing, store).unwrap_err();
+        assert!(err.to_string().contains("nope"));
+        let c = validate_s3_config(&s3_spec("b", Some(HAPPY_OPTS), Some("op://x"))).unwrap();
+        assert!(resolve_credentials(&c, |_| Err::<Option<String>, ()>(())).is_err());
+        assert!(resolve_credentials(&c, |_| Ok::<_, ()>(Some(String::new()))).is_err());
+    }
+
+    #[test]
+    fn credential_option_names_the_secret_when_spec_has_none() {
+        let c = validate_s3_config(&s3_spec(
+            "b",
+            Some(&format!("{HAPPY_OPTS},credential=sk")),
+            None,
+        ))
+        .unwrap();
+        assert_eq!(c.secret_access_key, SecretRef("sk".into()));
+        assert!(!c.extra.iter().any(|e| e.contains("sk")));
     }
 
     #[test]
