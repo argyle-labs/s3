@@ -368,6 +368,54 @@ fn check_extra(tool: MountTool, opt: &str) -> Result<(), StorageError> {
             tool.as_option_value()
         )));
     }
+    if tool == MountTool::MountpointS3 && name == "cache" {
+        let dir = opt.split_once('=').map(|(_, v)| v).unwrap_or("");
+        check_cache_dir(dir)?;
+    }
+    Ok(())
+}
+
+fn check_cache_dir(dir: &str) -> Result<(), StorageError> {
+    let p = Path::new(dir);
+    let shared = ["/tmp", "/var/tmp", "/dev/shm"];
+    let ok = p.is_absolute()
+        && !dir.split('/').any(|c| c == "." || c == "..")
+        && !shared.iter().any(|s| p.starts_with(s));
+    if !ok {
+        return Err(StorageError::Other(format!(
+            "s3: `cache={dir}` must be an absolute private path outside /tmp, /var/tmp and /dev/shm"
+        )));
+    }
+    Ok(())
+}
+
+pub fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+    let invalid =
+        |m: &str| std::io::Error::new(std::io::ErrorKind::PermissionDenied, m.to_string());
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.is_dir() {
+        return Err(invalid("cache path is not a directory"));
+    }
+    if meta.permissions().mode() & 0o077 != 0 {
+        return Err(invalid("cache directory must be mode 0700"));
+    }
+    let probe = dir.join(format!(".orca-owner-probe-{}", std::process::id()));
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&probe)?;
+    let mine = f.metadata()?.uid();
+    drop(f);
+    std::fs::remove_file(&probe)?;
+    if mine != meta.uid() {
+        return Err(invalid("cache directory must be owned by the mount user"));
+    }
     Ok(())
 }
 
@@ -573,6 +621,15 @@ pub fn mount_args(cfg: &S3Config, target: &str) -> Vec<String> {
 async fn spawn_mount(cfg: &S3Config, target: &str, secret: &str) -> Result<(), S3Error> {
     let bin = cfg.tool.binary();
     which(bin).ok_or_else(|| S3Error::MissingTool(bin.to_string()))?;
+    if cfg.tool == MountTool::MountpointS3 {
+        for e in &cfg.extra {
+            if flag_name(e) == "cache" {
+                if let Some((_, dir)) = e.split_once('=') {
+                    ensure_private_dir(Path::new(dir))?;
+                }
+            }
+        }
+    }
     let mut cmd = Command::new(bin).args(mount_args(cfg, target));
     if cfg.tool == MountTool::Rclone {
         for (k, v) in rclone_env(cfg, secret) {
@@ -961,6 +1018,47 @@ mod tests {
                 assert!(validate_s3_config(&spec).is_err(), "{tool} {opt}");
             }
         }
+    }
+
+    #[test]
+    fn mountpoint_cache_requires_private_absolute_path() {
+        for bad in [
+            "cache",
+            "cache=",
+            "cache=relative/dir",
+            "cache=/tmp/c",
+            "cache=/tmp",
+            "cache=/var/tmp/c",
+            "cache=/dev/shm/c",
+            "cache=/srv/../tmp/c",
+            "cache=/srv/./c",
+        ] {
+            let spec = s3_spec("b", Some(&format!("{HAPPY_OPTS},{bad}")), Some("op://x"));
+            assert!(validate_s3_config(&spec).is_err(), "{bad}");
+        }
+        let spec = s3_spec(
+            "b",
+            Some(&format!("{HAPPY_OPTS},cache=/var/cache/orca/s3/m1")),
+            Some("op://x"),
+        );
+        assert!(validate_s3_config(&spec).is_ok());
+    }
+
+    #[test]
+    fn ensure_private_dir_creates_0700_and_rejects_open_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("s3-cache-test-{}", std::process::id()));
+        let dir = base.join("a/b");
+        ensure_private_dir(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(ensure_private_dir(&dir).is_err());
+        let file = base.join("f");
+        std::fs::write(&file, b"").unwrap();
+        assert!(ensure_private_dir(&file).is_err());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]
