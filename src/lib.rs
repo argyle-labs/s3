@@ -277,11 +277,27 @@ pub fn validate_s3_config(spec: &MountSpec) -> Result<S3Config, StorageError> {
 }
 
 fn is_loopback(rest: &str) -> bool {
-    let authority = rest.split('/').next().unwrap_or("");
-    let host = match authority.strip_prefix('[') {
-        Some(v6) => v6.split(']').next().unwrap_or(""),
-        None => authority.split(':').next().unwrap_or(""),
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.contains(['@', '\\']) || authority.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(v6) => match v6.split_once(']') {
+            Some((h, p)) => (h, p),
+            None => return false,
+        },
+        None => match authority.split_once(':') {
+            Some((h, p)) => (h, &authority[h.len()..][..p.len() + 1]),
+            None => (authority, ""),
+        },
     };
+    if !(port.is_empty()
+        || port
+            .strip_prefix(':')
+            .is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())))
+    {
+        return false;
+    }
     host.eq_ignore_ascii_case("localhost")
         || host
             .parse::<std::net::IpAddr>()
@@ -953,6 +969,14 @@ mod tests {
             "http://s3.example.com",
             "http://10.0.0.5:9000",
             "http://localhost.evil.com",
+            "http://localhost:x@evil.com",
+            "http://[::1]@evil.com",
+            "http://[::1]:9000@evil.com",
+            "http://127.0.0.1:80@evil.com",
+            "http://localhost\\@evil.com",
+            "http://127.0.0.1.nip.io",
+            "http://[::ffff:10.0.0.5]",
+            "HTTP://s3.example.com",
         ] {
             let opts = format!("endpoint={ep},region=r,access_key=A");
             assert!(
