@@ -467,16 +467,25 @@ impl std::fmt::Debug for S3Credentials {
     }
 }
 
+pub const S3_SECRET_PREFIX: &str = "s3.";
+
 pub fn resolve_credentials<F, E>(cfg: &S3Config, get: F) -> Result<S3Credentials, StorageError>
 where
     F: Fn(&str) -> Result<Option<String>, E>,
 {
-    let resolve = |r: &SecretRef| match get(&r.0) {
-        Ok(Some(v)) if !v.is_empty() => Ok(v),
-        _ => Err(StorageError::Other(format!(
-            "s3: secret '{}' is not resolvable",
-            r.0
-        ))),
+    let resolve = |r: &SecretRef| {
+        let name = r.0.trim();
+        if !name.starts_with(S3_SECRET_PREFIX) || name.len() == S3_SECRET_PREFIX.len() {
+            return Err(StorageError::Other(format!(
+                "s3: secret '{name}' is outside the `{S3_SECRET_PREFIX}` namespace"
+            )));
+        }
+        match get(name) {
+            Ok(Some(v)) if !v.trim().is_empty() => Ok(v),
+            _ => Err(StorageError::Other(format!(
+                "s3: secret '{name}' is not resolvable"
+            ))),
+        }
     };
     Ok(S3Credentials {
         access_key_id: resolve(&cfg.access_key_id)?,
@@ -1303,15 +1312,17 @@ mod tests {
 
     fn store(name: &str) -> Result<Option<String>, ()> {
         Ok(match name {
-            "AKIA" => Some("resolved-ak".into()),
-            "op://x" => Some("resolved-sk".into()),
+            "s3.ak" => Some("resolved-ak".into()),
+            "s3.sk" => Some("resolved-sk".into()),
+            "AKIA" | "op://x" | "other.plugin.token" => Some("leaked".into()),
             _ => None,
         })
     }
 
     #[test]
     fn credentials_resolve_by_name_never_from_the_ref_string() {
-        let c = validate_s3_config(&s3_spec("b", Some(HAPPY_OPTS), Some("op://x"))).unwrap();
+        let opts = "endpoint=https://s3.example.com,region=us-east-1,access_key=s3.ak";
+        let c = validate_s3_config(&s3_spec("b", Some(opts), Some("s3.sk"))).unwrap();
         let r = resolve_credentials(&c, store).unwrap();
         assert_eq!(r.access_key_id, "resolved-ak");
         assert_eq!(r.secret_access_key, "resolved-sk");
@@ -1319,15 +1330,34 @@ mod tests {
         assert_ne!(r.secret_access_key, c.secret_access_key.0);
         assert!(!format!("{r:?}").contains("resolved"));
         let env = rclone_env(&c, &r);
-        assert!(env.iter().all(|(_, v)| v != "op://x" && v != "AKIA"));
+        assert!(env.iter().all(|(_, v)| v != "s3.sk" && v != "s3.ak"));
+    }
+
+    #[test]
+    fn credentials_refuse_names_outside_the_s3_namespace() {
+        for (ak, sk) in [
+            ("s3.ak", "other.plugin.token"),
+            ("other.plugin.token", "s3.sk"),
+            ("AKIA", "s3.sk"),
+            ("s3.", "s3.sk"),
+        ] {
+            let opts = format!("endpoint=https://s3.example.com,region=r,access_key={ak}");
+            let c = validate_s3_config(&s3_spec("b", Some(&opts), Some(sk))).unwrap();
+            let err = resolve_credentials(&c, store).unwrap_err();
+            assert!(!err.to_string().contains("leaked"));
+        }
+        let opts = "endpoint=https://s3.example.com,region=r,access_key=s3.ak";
+        let c = validate_s3_config(&s3_spec("b", Some(opts), Some("s3.sk"))).unwrap();
+        assert!(resolve_credentials(&c, |_| Ok::<_, ()>(Some("  \n".into()))).is_err());
     }
 
     #[test]
     fn credentials_fail_closed_when_unresolvable() {
-        let missing = validate_s3_config(&s3_spec("b", Some(HAPPY_OPTS), Some("nope"))).unwrap();
+        let opts = "endpoint=https://s3.example.com,region=r,access_key=s3.ak";
+        let missing = validate_s3_config(&s3_spec("b", Some(opts), Some("s3.nope"))).unwrap();
         let err = resolve_credentials(&missing, store).unwrap_err();
-        assert!(err.to_string().contains("nope"));
-        let c = validate_s3_config(&s3_spec("b", Some(HAPPY_OPTS), Some("op://x"))).unwrap();
+        assert!(err.to_string().contains("'s3.nope' is not resolvable"));
+        let c = validate_s3_config(&s3_spec("b", Some(opts), Some("s3.sk"))).unwrap();
         assert!(resolve_credentials(&c, |_| Err::<Option<String>, ()>(())).is_err());
         assert!(resolve_credentials(&c, |_| Ok::<_, ()>(Some(String::new()))).is_err());
     }
