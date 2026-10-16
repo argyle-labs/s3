@@ -152,8 +152,8 @@ pub struct S3Config {
     pub bucket: String,
     /// Key prefix inside the bucket, without leading/trailing `/`; empty for the root.
     pub prefix: String,
-    /// S3-compatible endpoint URL (`http://` or `https://`).
     pub endpoint: String,
+    pub allow_insecure: bool,
     /// Region (`us-east-1`, `auto`, …).
     pub region: String,
     pub addressing: Addressing,
@@ -166,7 +166,6 @@ pub struct S3Config {
     /// Secret access key, resolved by the secrets domain from a [`SecretRef`].
     /// Never rendered into the option string or logged.
     pub secret_access_key: SecretRef,
-    /// Extra tool-specific options, preserved verbatim and order-stable.
     pub extra: Vec<String>,
 }
 
@@ -204,6 +203,7 @@ pub fn validate_s3_config(spec: &MountSpec) -> Result<S3Config, StorageError> {
     let mut storage_class: Option<String> = None;
     let mut access_key_id: Option<String> = None;
     let mut tool = MountTool::MountpointS3;
+    let mut allow_insecure = false;
     let mut extra: Vec<String> = Vec::new();
 
     let raw = spec.options.as_deref().unwrap_or("");
@@ -219,8 +219,8 @@ pub fn validate_s3_config(spec: &MountSpec) -> Result<S3Config, StorageError> {
             ("storage_class", Some(v)) if !v.is_empty() => storage_class = Some(v),
             ("access_key" | "access_key_id", Some(v)) => access_key_id = Some(v),
             ("tool", Some(v)) => tool = MountTool::parse(&v)?,
-            // The secret key must never be declared inline in the store — it is a
-            // secrets-domain `SecretRef` carried in the spec's `credential`.
+            ("allow_insecure", None) => allow_insecure = true,
+            ("allow_insecure", Some(v)) => allow_insecure = v == "true",
             ("secret_key" | "secret_access_key" | "password", _) => {
                 return Err(StorageError::Other(
                     "s3: the secret access key must be supplied as a credential SecretRef, \
@@ -228,7 +228,6 @@ pub fn validate_s3_config(spec: &MountSpec) -> Result<S3Config, StorageError> {
                         .to_string(),
                 ));
             }
-            // Unknown-but-legal tool option: preserve verbatim, order-stable.
             _ => extra.push(opt.to_string()),
         }
     }
@@ -236,10 +235,18 @@ pub fn validate_s3_config(spec: &MountSpec) -> Result<S3Config, StorageError> {
     let endpoint = endpoint.ok_or_else(|| {
         StorageError::Other("s3: `endpoint=` is required in the mount options".into())
     })?;
-    if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
-        return Err(StorageError::Other(format!(
-            "s3: `endpoint={endpoint}` must be an http:// or https:// URL"
-        )));
+    match endpoint.strip_prefix("http://") {
+        Some(rest) if !allow_insecure && !is_loopback(rest) => {
+            return Err(StorageError::Other(format!(
+                "s3: `endpoint={endpoint}` must be https:// (http:// only for loopback or allow_insecure)"
+            )));
+        }
+        None if !endpoint.starts_with("https://") => {
+            return Err(StorageError::Other(format!(
+                "s3: `endpoint={endpoint}` must be an https:// URL"
+            )));
+        }
+        _ => {}
     }
     let region = region.filter(|r| !r.is_empty()).ok_or_else(|| {
         StorageError::Other("s3: `region=` is required in the mount options".into())
@@ -247,6 +254,9 @@ pub fn validate_s3_config(spec: &MountSpec) -> Result<S3Config, StorageError> {
     let access_key_id = access_key_id.ok_or_else(|| {
         StorageError::Other("s3: `access_key=` is required in the mount options".into())
     })?;
+    for e in &extra {
+        check_extra(tool, e)?;
+    }
     let secret_access_key = spec.credential.clone().ok_or_else(|| {
         StorageError::Other("s3: a credential SecretRef (the secret access key) is required".into())
     })?;
@@ -255,6 +265,7 @@ pub fn validate_s3_config(spec: &MountSpec) -> Result<S3Config, StorageError> {
         bucket,
         prefix,
         endpoint,
+        allow_insecure,
         region,
         addressing,
         storage_class,
@@ -263,6 +274,91 @@ pub fn validate_s3_config(spec: &MountSpec) -> Result<S3Config, StorageError> {
         secret_access_key,
         extra,
     })
+}
+
+fn is_loopback(rest: &str) -> bool {
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+const DENIED_FLAGS: &[&str] = &[
+    "no-check-certificate",
+    "no-verify-ssl",
+    "ca-bundle",
+    "insecure",
+    "allow-other",
+    "allow_other",
+    "umask",
+    "file-mode",
+    "dir-mode",
+    "file-perms",
+    "dir-perms",
+];
+
+fn allowed_flags(tool: MountTool) -> &'static [&'static str] {
+    match tool {
+        MountTool::MountpointS3 => &[
+            "read-only",
+            "allow-delete",
+            "allow-overwrite",
+            "auto-unmount",
+            "uid",
+            "gid",
+            "cache",
+            "max-cache-size",
+            "metadata-ttl",
+            "part-size",
+            "max-threads",
+        ],
+        MountTool::Rclone => &[
+            "read-only",
+            "uid",
+            "gid",
+            "vfs-cache-mode",
+            "vfs-cache-max-size",
+            "vfs-cache-max-age",
+            "dir-cache-time",
+            "buffer-size",
+            "transfers",
+        ],
+        MountTool::Goofys => &[
+            "uid",
+            "gid",
+            "stat-cache-ttl",
+            "type-cache-ttl",
+            "cheap",
+            "sse",
+        ],
+    }
+}
+
+fn flag_name(opt: &str) -> &str {
+    let opt = opt.trim_start_matches('-');
+    opt.split_once('=').map_or(opt, |(k, _)| k)
+}
+
+fn check_extra(tool: MountTool, opt: &str) -> Result<(), StorageError> {
+    let name = flag_name(opt);
+    if DENIED_FLAGS.contains(&name) || !allowed_flags(tool).contains(&name) {
+        return Err(StorageError::Other(format!(
+            "s3: option `{opt}` is not allowed for {}",
+            tool.as_option_value()
+        )));
+    }
+    Ok(())
+}
+
+fn extra_args(cfg: &S3Config) -> impl Iterator<Item = String> + '_ {
+    cfg.extra
+        .iter()
+        .map(|e| format!("--{}", e.trim_start_matches('-')))
 }
 
 /// Render a validated [`S3Config`] back into the canonical, comma-joined option
@@ -280,6 +376,9 @@ pub fn render_s3_options(cfg: &S3Config) -> String {
     ];
     if let Some(sc) = &cfg.storage_class {
         parts.push(format!("storage_class={sc}"));
+    }
+    if cfg.allow_insecure {
+        parts.push("allow_insecure=true".to_string());
     }
     parts.extend(cfg.extra.iter().cloned());
     parts.join(",")
@@ -391,77 +490,83 @@ impl Default for S3Backend {
 /// `secret` is the *resolved* secret access key. In the wired-up flow orca's
 /// secrets domain resolves `cfg.secret_access_key` before calling the backend;
 /// until that seam exists, callers pass the raw `SecretRef` inner string.
-async fn spawn_mount(cfg: &S3Config, target: &str, secret: &str) -> Result<(), S3Error> {
-    let bin = cfg.tool.binary();
-    which(bin).ok_or_else(|| S3Error::MissingTool(bin.to_string()))?;
-
-    let mut cmd = match cfg.tool {
+pub fn mount_args(cfg: &S3Config, target: &str) -> Vec<String> {
+    let mut a: Vec<String> = Vec::new();
+    match cfg.tool {
         MountTool::MountpointS3 => {
-            // `mount-s3 <bucket> <mountpoint> --endpoint-url <ep> --region <r>`
-            let mut c = Command::new(bin);
-            c = c
-                .arg(&cfg.bucket)
-                .arg(target)
-                .arg("--endpoint-url")
-                .arg(&cfg.endpoint)
-                .arg("--region")
-                .arg(&cfg.region);
+            a.extend([
+                cfg.bucket.clone(),
+                target.to_string(),
+                "--endpoint-url".into(),
+                cfg.endpoint.clone(),
+                "--region".into(),
+                cfg.region.clone(),
+                "--file-mode".into(),
+                "0600".into(),
+                "--dir-mode".into(),
+                "0700".into(),
+            ]);
             if cfg.addressing == Addressing::Path {
-                c = c.arg("--force-path-style");
+                a.push("--force-path-style".into());
             }
             if !cfg.prefix.is_empty() {
-                c = c.arg("--prefix").arg(format!("{}/", cfg.prefix));
+                a.extend(["--prefix".into(), format!("{}/", cfg.prefix)]);
             }
-            for e in &cfg.extra {
-                c = c.arg(e);
-            }
-            c
+            a.extend(extra_args(cfg));
         }
         MountTool::Rclone => {
-            // Endpoint, region, addressing and credentials ride `rclone_env`.
-            let mut c = Command::new(bin);
-            c = c.arg("mount").arg(rclone_remote(cfg)).arg(target);
-            for e in &cfg.extra {
-                c = c.arg(e);
-            }
-            for (k, v) in rclone_env(cfg, secret) {
-                c = c.env(k, v);
-            }
-            return c.spawn().map(|_| ()).map_err(Into::into);
+            a.extend([
+                "mount".into(),
+                rclone_remote(cfg),
+                target.to_string(),
+                "--file-perms".into(),
+                "0600".into(),
+                "--dir-perms".into(),
+                "0700".into(),
+            ]);
+            a.extend(extra_args(cfg));
         }
         MountTool::Goofys => {
-            // `goofys --endpoint <ep> --region <r> <bucket> <mountpoint>`
-            let mut c = Command::new(bin);
-            c = c
-                .arg("--endpoint")
-                .arg(&cfg.endpoint)
-                .arg("--region")
-                .arg(&cfg.region);
+            a.extend([
+                "--endpoint".into(),
+                cfg.endpoint.clone(),
+                "--region".into(),
+                cfg.region.clone(),
+                "--file-mode".into(),
+                "0600".into(),
+                "--dir-mode".into(),
+                "0700".into(),
+            ]);
             if cfg.addressing == Addressing::VirtualHost {
-                c = c.arg("--subdomain");
+                a.push("--subdomain".into());
             }
-            for e in &cfg.extra {
-                c = c.arg(e);
-            }
-            let bucket = if cfg.prefix.is_empty() {
+            a.extend(extra_args(cfg));
+            a.push(if cfg.prefix.is_empty() {
                 cfg.bucket.clone()
             } else {
                 format!("{}:{}", cfg.bucket, cfg.prefix)
-            };
-            c.arg(bucket).arg(target)
+            });
+            a.push(target.to_string());
         }
-    };
+    }
+    a
+}
 
-    // Credentials via environment — the standard AWS SDK / tool convention —
-    // so the secret never appears on the command line or in the option string.
-    cmd = cmd
-        .env("AWS_ACCESS_KEY_ID", &cfg.access_key_id)
-        .env("AWS_SECRET_ACCESS_KEY", secret);
-
-    // Spawn the long-lived FUSE daemon. It backgrounds itself (mountpoint-s3,
-    // goofys) or stays foreground (rclone); either way the mount is realized
-    // once spawn succeeds. Supervision of the resulting process is the core
-    // UserspaceProcess-applier follow-up.
+/// Launch the configured FUSE tool to mount `bucket` at `target`. The resolved
+/// secret is passed through the child's environment, never the command line.
+async fn spawn_mount(cfg: &S3Config, target: &str, secret: &str) -> Result<(), S3Error> {
+    let bin = cfg.tool.binary();
+    which(bin).ok_or_else(|| S3Error::MissingTool(bin.to_string()))?;
+    let mut cmd = Command::new(bin).args(mount_args(cfg, target));
+    if cfg.tool == MountTool::Rclone {
+        for (k, v) in rclone_env(cfg, secret) {
+            cmd = cmd.env(k, v);
+        }
+    } else {
+        cmd = cmd
+            .env("AWS_ACCESS_KEY_ID", &cfg.access_key_id)
+            .env("AWS_SECRET_ACCESS_KEY", secret);
+    }
     cmd.spawn()?;
     Ok(())
 }
@@ -801,15 +906,89 @@ mod tests {
     }
 
     #[test]
-    fn validate_preserves_unknown_options_in_extra() {
+    fn validate_keeps_allowlisted_extra_options() {
         let spec = s3_spec(
             "b",
-            Some(&format!("{HAPPY_OPTS},allow-other,uid=1000")),
+            Some(&format!("{HAPPY_OPTS},read-only,uid=1000")),
             Some("op://x"),
         );
         let cfg = validate_s3_config(&spec).unwrap();
-        assert!(cfg.extra.contains(&"allow-other".to_string()));
-        assert!(cfg.extra.contains(&"uid=1000".to_string()));
+        assert_eq!(cfg.extra, ["read-only", "uid=1000"]);
+        let args = mount_args(&cfg, "/mnt/o");
+        assert!(args.contains(&"--read-only".to_string()));
+        assert!(args.contains(&"--uid=1000".to_string()));
+    }
+
+    #[test]
+    fn validate_rejects_denied_and_unlisted_extra_options() {
+        for tool in ["mountpoint-s3", "rclone", "goofys"] {
+            for opt in [
+                "--no-check-certificate",
+                "no-verify-ssl",
+                "ca-bundle=/tmp/ca.pem",
+                "--insecure",
+                "allow-other",
+                "allow_other",
+                "umask=000",
+                "file-mode=0777",
+                "dir-mode=0777",
+                "--file-perms=0777",
+                "--dir-perms=0777",
+                "--endpoint-url=http://evil",
+                "-o",
+            ] {
+                let spec = s3_spec(
+                    "b",
+                    Some(&format!("{HAPPY_OPTS},tool={tool},{opt}")),
+                    Some("op://x"),
+                );
+                assert!(validate_s3_config(&spec).is_err(), "{tool} {opt}");
+            }
+        }
+    }
+
+    #[test]
+    fn http_endpoint_requires_loopback_or_allow_insecure() {
+        for ep in [
+            "http://s3.example.com",
+            "http://10.0.0.5:9000",
+            "http://localhost.evil.com",
+        ] {
+            let opts = format!("endpoint={ep},region=r,access_key=A");
+            assert!(
+                validate_s3_config(&s3_spec("b", Some(&opts), Some("op://x"))).is_err(),
+                "{ep}"
+            );
+        }
+        for ep in [
+            "http://localhost:9000",
+            "http://127.0.0.1:9000/",
+            "http://[::1]:9000",
+        ] {
+            let opts = format!("endpoint={ep},region=r,access_key=A");
+            assert!(
+                validate_s3_config(&s3_spec("b", Some(&opts), Some("op://x"))).is_ok(),
+                "{ep}"
+            );
+        }
+        let c = cfg("endpoint=http://10.0.0.5:9000,region=r,access_key=A,allow_insecure");
+        assert!(c.allow_insecure);
+        assert!(render_s3_options(&c).contains("allow_insecure=true"));
+        assert!(!cfg(HAPPY_OPTS).allow_insecure);
+    }
+
+    #[test]
+    fn mounts_default_to_private_modes() {
+        for (tool, file, dir) in [
+            ("mountpoint-s3", "--file-mode", "--dir-mode"),
+            ("rclone", "--file-perms", "--dir-perms"),
+            ("goofys", "--file-mode", "--dir-mode"),
+        ] {
+            let args = mount_args(&cfg(&format!("{HAPPY_OPTS},tool={tool}")), "/mnt/o");
+            let after = |f: &str| args[args.iter().position(|a| a == f).unwrap() + 1].clone();
+            assert_eq!(after(file), "0600", "{tool}");
+            assert_eq!(after(dir), "0700", "{tool}");
+        }
     }
 
     #[test]
