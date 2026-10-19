@@ -32,7 +32,7 @@ path = "src/main.rs"
 # SecretRef — is reached through `plugin-toolkit`, tracked at orca `main`
 # (fleet-canonical form) so this plugin always builds against the latest contract.
 [dependencies]
-plugin-toolkit = { git = "https://github.com/argyle-labs/orca", tag = "v0.2.1-rc.14", default-features = false, features = ["tools", "db"] }
+plugin-toolkit = { git = "https://github.com/argyle-labs/orca", branch = "main", package = "orca-plugin-toolkit", default-features = false, features = ["tools", "db"] }
 
 [dev-dependencies]
 # Dev-only: the in-crate test harness drives the async `S3Backend` methods under

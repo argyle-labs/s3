@@ -37,6 +37,7 @@ use plugin_toolkit::orca_async;
 use plugin_toolkit::path::which;
 use plugin_toolkit::prelude::*;
 use plugin_toolkit::process::Command;
+use plugin_toolkit::secrets::Secret;
 use plugin_toolkit::storage::{
     Capability, MountOutcome, MountSpec, MountStyle, NormalizedSpec, OptionSet, SecretRef, Share,
     StorageBackend, StorageError, StorageKind,
@@ -252,9 +253,12 @@ pub fn validate_s3_config(spec: &MountSpec) -> Result<S3Config, StorageError> {
     })?;
     let access_key_id = access_key_id
         .filter(|v| !v.is_empty())
-        .map(SecretRef)
         .ok_or_else(|| {
             StorageError::Other("s3: `access_key=` is required in the mount options".into())
+        })
+        .and_then(|v| {
+            SecretRef::from_stored(v)
+                .map_err(|e| StorageError::Other(format!("s3: `access_key=`: {e}")))
         })?;
     for e in &extra {
         check_extra(tool, e)?;
@@ -262,7 +266,12 @@ pub fn validate_s3_config(spec: &MountSpec) -> Result<S3Config, StorageError> {
     let secret_access_key = spec
         .credential
         .clone()
-        .or(credential.map(SecretRef))
+        .or(credential
+            .map(|c| {
+                SecretRef::from_stored(c)
+                    .map_err(|e| StorageError::Other(format!("s3: `credential=`: {e}")))
+            })
+            .transpose()?)
         .ok_or_else(|| {
             StorageError::Other(
                 "s3: a credential SecretRef (the secret access key) is required".into(),
@@ -443,7 +452,7 @@ pub fn render_s3_options(cfg: &S3Config) -> String {
         format!("endpoint={}", cfg.endpoint),
         format!("region={}", cfg.region),
         format!("addressing={}", cfg.addressing.as_option_value()),
-        format!("access_key={}", cfg.access_key_id.0),
+        format!("access_key={}", cfg.access_key_id.as_str()),
         format!("tool={}", cfg.tool.as_option_value()),
     ];
     if let Some(sc) = &cfg.storage_class {
@@ -457,8 +466,8 @@ pub fn render_s3_options(cfg: &S3Config) -> String {
 }
 
 pub struct S3Credentials {
-    access_key_id: String,
-    secret_access_key: String,
+    access_key_id: Secret<String>,
+    secret_access_key: Secret<String>,
 }
 
 impl std::fmt::Debug for S3Credentials {
@@ -471,17 +480,17 @@ pub const S3_SECRET_PREFIX: &str = "s3.";
 
 pub fn resolve_credentials<F, E>(cfg: &S3Config, get: F) -> Result<S3Credentials, StorageError>
 where
-    F: Fn(&str) -> Result<Option<String>, E>,
+    F: Fn(&str) -> Result<Option<Secret<String>>, E>,
 {
     let resolve = |r: &SecretRef| {
-        let name = r.0.trim();
+        let name = r.as_str().trim();
         if !name.starts_with(S3_SECRET_PREFIX) || name.len() == S3_SECRET_PREFIX.len() {
             return Err(StorageError::Other(format!(
                 "s3: secret '{name}' is outside the `{S3_SECRET_PREFIX}` namespace"
             )));
         }
         match get(name) {
-            Ok(Some(v)) if !v.trim().is_empty() => Ok(v),
+            Ok(Some(v)) if !v.expose_secret().trim().is_empty() => Ok(v),
             _ => Err(StorageError::Other(format!(
                 "s3: secret '{name}' is not resolvable"
             ))),
@@ -509,11 +518,11 @@ pub fn rclone_env(cfg: &S3Config, creds: &S3Credentials) -> Vec<(String, String)
         ),
         (
             "RCLONE_S3_ACCESS_KEY_ID".to_string(),
-            creds.access_key_id.clone(),
+            creds.access_key_id.expose_secret().clone(),
         ),
         (
             "RCLONE_S3_SECRET_ACCESS_KEY".to_string(),
-            creds.secret_access_key.clone(),
+            creds.secret_access_key.expose_secret().clone(),
         ),
     ];
     if let Some(sc) = &cfg.storage_class {
@@ -678,8 +687,11 @@ async fn spawn_mount(cfg: &S3Config, target: &str, creds: &S3Credentials) -> Res
         }
     } else {
         cmd = cmd
-            .env("AWS_ACCESS_KEY_ID", &creds.access_key_id)
-            .env("AWS_SECRET_ACCESS_KEY", &creds.secret_access_key);
+            .env("AWS_ACCESS_KEY_ID", creds.access_key_id.expose_secret())
+            .env(
+                "AWS_SECRET_ACCESS_KEY",
+                creds.secret_access_key.expose_secret(),
+            );
     }
     cmd.spawn()?;
     Ok(())
@@ -874,7 +886,7 @@ mod tests {
             source: source.into(),
             failover_sources: vec![],
             options: options.map(str::to_string),
-            credential: credential.map(|s| SecretRef(s.to_string())),
+            credential: credential.map(|s| SecretRef::parse(s).unwrap()),
             remount_policy: None,
             enabled: true,
         }
@@ -919,11 +931,11 @@ mod tests {
         assert_eq!(cfg.bucket, "my-bucket");
         assert_eq!(cfg.endpoint, "https://s3.example.com");
         assert_eq!(cfg.region, "us-east-1");
-        assert_eq!(cfg.access_key_id, SecretRef("AKIA".into()));
+        assert_eq!(cfg.access_key_id, SecretRef::from_stored("AKIA").unwrap());
         assert_eq!(cfg.tool, MountTool::MountpointS3); // default
         assert_eq!(
             cfg.secret_access_key,
-            SecretRef("op://vault/s3-secret".into())
+            SecretRef::parse("op://vault/s3-secret").unwrap()
         );
     }
 
@@ -1305,18 +1317,19 @@ mod tests {
 
     fn creds(a: &str, s: &str) -> S3Credentials {
         S3Credentials {
-            access_key_id: a.into(),
-            secret_access_key: s.into(),
+            access_key_id: Secret::new(a.into()),
+            secret_access_key: Secret::new(s.into()),
         }
     }
 
-    fn store(name: &str) -> Result<Option<String>, ()> {
+    fn store(name: &str) -> Result<Option<Secret<String>>, ()> {
         Ok(match name {
             "s3.ak" => Some("resolved-ak".into()),
             "s3.sk" => Some("resolved-sk".into()),
             "AKIA" | "op://x" | "other.plugin.token" => Some("leaked".into()),
             _ => None,
-        })
+        }
+        .map(Secret::new))
     }
 
     #[test]
@@ -1324,10 +1337,13 @@ mod tests {
         let opts = "endpoint=https://s3.example.com,region=us-east-1,access_key=s3.ak";
         let c = validate_s3_config(&s3_spec("b", Some(opts), Some("s3.sk"))).unwrap();
         let r = resolve_credentials(&c, store).unwrap();
-        assert_eq!(r.access_key_id, "resolved-ak");
-        assert_eq!(r.secret_access_key, "resolved-sk");
-        assert_ne!(r.access_key_id, c.access_key_id.0);
-        assert_ne!(r.secret_access_key, c.secret_access_key.0);
+        assert_eq!(r.access_key_id.expose_secret(), "resolved-ak");
+        assert_eq!(r.secret_access_key.expose_secret(), "resolved-sk");
+        assert_ne!(r.access_key_id.expose_secret(), c.access_key_id.as_str());
+        assert_ne!(
+            r.secret_access_key.expose_secret(),
+            c.secret_access_key.as_str()
+        );
         assert!(!format!("{r:?}").contains("resolved"));
         let env = rclone_env(&c, &r);
         assert!(env.iter().all(|(_, v)| v != "s3.sk" && v != "s3.ak"));
@@ -1339,16 +1355,19 @@ mod tests {
             ("s3.ak", "other.plugin.token"),
             ("other.plugin.token", "s3.sk"),
             ("AKIA", "s3.sk"),
-            ("s3.", "s3.sk"),
         ] {
             let opts = format!("endpoint=https://s3.example.com,region=r,access_key={ak}");
             let c = validate_s3_config(&s3_spec("b", Some(&opts), Some(sk))).unwrap();
             let err = resolve_credentials(&c, store).unwrap_err();
             assert!(!err.to_string().contains("leaked"));
         }
+        let opts = "endpoint=https://s3.example.com,region=r,access_key=s3.";
+        assert!(validate_s3_config(&s3_spec("b", Some(opts), Some("s3.sk"))).is_err());
         let opts = "endpoint=https://s3.example.com,region=r,access_key=s3.ak";
         let c = validate_s3_config(&s3_spec("b", Some(opts), Some("s3.sk"))).unwrap();
-        assert!(resolve_credentials(&c, |_| Ok::<_, ()>(Some("  \n".into()))).is_err());
+        assert!(
+            resolve_credentials(&c, |_| Ok::<_, ()>(Some(Secret::new("  \n".into())))).is_err()
+        );
     }
 
     #[test]
@@ -1358,8 +1377,10 @@ mod tests {
         let err = resolve_credentials(&missing, store).unwrap_err();
         assert!(err.to_string().contains("'s3.nope' is not resolvable"));
         let c = validate_s3_config(&s3_spec("b", Some(opts), Some("s3.sk"))).unwrap();
-        assert!(resolve_credentials(&c, |_| Err::<Option<String>, ()>(())).is_err());
-        assert!(resolve_credentials(&c, |_| Ok::<_, ()>(Some(String::new()))).is_err());
+        assert!(resolve_credentials(&c, |_| Err::<Option<Secret<String>>, ()>(())).is_err());
+        assert!(
+            resolve_credentials(&c, |_| Ok::<_, ()>(Some(Secret::new(String::new())))).is_err()
+        );
     }
 
     #[test]
@@ -1370,7 +1391,7 @@ mod tests {
             None,
         ))
         .unwrap();
-        assert_eq!(c.secret_access_key, SecretRef("sk".into()));
+        assert_eq!(c.secret_access_key, SecretRef::from_stored("sk").unwrap());
         assert!(!c.extra.iter().any(|e| e.contains("sk")));
     }
 
