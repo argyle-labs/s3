@@ -1,0 +1,2 @@
+[registries.gitea]
+index = "sparse+https://gitea.scottkey.me/api/packages/argyle-labs/cargo/"
